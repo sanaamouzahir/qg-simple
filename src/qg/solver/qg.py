@@ -15,6 +15,13 @@ from qg.solver.integrator import Integrator
 
 from qg.solver.opt.operator.jacobian import advection_uv
 
+from qg._output.dataset import (
+    extract_obstacle_mask,
+    extract_sponge_mask,
+    build_dataset_npz,
+    write_metadata_yaml,
+)
+
 import os
 import logging
 import jpcm.draw as draw
@@ -32,6 +39,12 @@ class QG():
         # DictConfig already supports attribute access, so just use it directly
         # No need to convert - validate() expects object with attributes
         
+        # Snapshot the raw (pre-validation) config BEFORE vc.validate(...).solve()
+        # mutates it in place (turns the bc/mask/forcing dicts into callables).
+        # The FR-dataset save needs the dicts for the metadata sidecar and to know
+        # which sponge-mask variant to rebuild.
+        self.raw_param = OmegaConf.to_container(param, resolve=True) if isinstance(param, DictConfig) else dict(param)
+
         param = vc.validate(param).solve()
         self.param = param
         self.logger = logger
@@ -138,6 +151,37 @@ class QG():
         
         np.save(os.path.join(save_path,f'{name}.npy'), solution)
         self.logger.info(f"Simulation saved at {save_path}")
+
+        # ----------------------------------------------------------------- #
+        # FR dataset packed save: omega + static masks + run metadata.      #
+        # Consumed by spatial_closure/compute_pi_ff.py (Stage 2, Pi_FF).    #
+        # Scenario-agnostic: masks that are not active in this run are      #
+        # skipped.  times computed directly (this solver has no save_after, #
+        # so t_k = k * save_rate * dt is exact).                            #
+        # ----------------------------------------------------------------- #
+        omega_FR = solution[:, :, 0, ...]  # (B, T_save, Ny, Nx); channel 0 = vorticity (physical)
+
+        with torch.no_grad():
+            dummy_state = self.init()
+        chi_obs = extract_obstacle_mask(self.param, self.grid, self.derivative, dummy_state)
+        chi_sponge = extract_sponge_mask(
+            self.raw_param.get('qg', {}).get('bc', None) or self.raw_param.get('bc', None),
+            self.grid)
+
+        T_save = omega_FR.shape[1]
+        dataset = build_dataset_npz(omega_FR, chi_obs, chi_sponge,
+                                    save_index_count=T_save,
+                                    dt=self.param.time.dt,
+                                    save_rate=self.param.time.save_rate)
+        np.savez_compressed(os.path.join(save_path, f'{name}_FR.npz'), **dataset)
+        self.logger.info(f"FR dataset saved: {name}_FR.npz "
+                         f"(omega {omega_FR.shape}, "
+                         f"chi_obs={'yes' if chi_obs is not None else 'no'}, "
+                         f"chi_sponge={'yes' if chi_sponge is not None else 'no'})")
+
+        write_metadata_yaml(os.path.join(save_path, f'{name}_FR_params.yaml'),
+                            self.raw_param)
+        self.logger.info(f"FR run params saved at {name}_FR_params.yaml")
         
         # select a couple batches for visualization (permute 0,1 axes)
         solution_b = np.transpose(solution[0:4,:,:1,...],(1,0,2,3,4))  # T (selected_B) C H W
